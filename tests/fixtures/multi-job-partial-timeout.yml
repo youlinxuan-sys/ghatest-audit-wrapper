@@ -1,0 +1,22 @@
+# nit 1 fixture：兩個 job，一個有 timeout、一個沒有。
+# 舊版全檔 regex 只要有一個 timeout 就判過 → 漏報 job `lint`。
+# 新版逐 job 檢查應抓出 job `lint` 缺 timeout-minutes。
+name: Multi Job Partial Timeout
+on: push
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+      - run: echo build
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+      - run: echo lint

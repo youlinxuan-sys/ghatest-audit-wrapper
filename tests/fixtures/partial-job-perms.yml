@@ -1,0 +1,22 @@
+# bug 1 fixture：一個 job 有 job-level permissions、另一個沒有。
+# 修正前 has_top_perms 全檔搜尋 → build 的 permissions 讓 lint 漏報。
+# 修正後 has_top_perms 只看 jobs: 之前 → 應抓出 job `lint` 缺 permissions。
+name: Partial Job Perms
+on: push
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+      - run: echo build
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+      - run: echo lint

@@ -1,0 +1,17 @@
+# bug 4 fixture：uses 的值用引號包起來的 local action 與 docker action。
+# 修正前 startswith("./") / startswith("docker://") 因值含引號失效 → 誤報 missing ref。
+# 修正後先剝成對引號再判斷 → 這兩個都該被排除，整份應為 OK。
+name: Quoted Uses
+on: push
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: './.github/actions/local-setup'
+      - uses: "docker://alpine:3.19"
+      - run: echo build

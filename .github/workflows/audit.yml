@@ -20,6 +20,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
 
+      - name: Install PyYAML
+        # pin minor 版本 —— 避免 PyPI 新版 breaking change 讓 audit 自己壞
+        run: pip install --quiet 'pyyaml~=6.0'
+
       - name: Audit real workflows
         id: audit_real
         run: |

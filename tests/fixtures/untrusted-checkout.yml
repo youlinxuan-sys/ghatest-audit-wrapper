@@ -1,0 +1,22 @@
+# 額外 fixture：pull_request_target 下 checkout PR head ref + 引用 secret。
+# 經典「untrusted code checkout」攻擊面 —— fork PR 的程式碼被 checkout 後
+# 與 secret 同框執行。新版應抓出 S1。
+name: Untrusted Checkout
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: npm install && npm test
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,19 @@
+# nit 3 fixture：secret 先綁進 env 變數，再 echo 該變數。
+# 舊版 S2 只抓 secret 表達式直接出現在 shell 那一行，這種間接寫法漏抓。
+# 新版應抓出 S2（env-then-echo），整份只該有「一筆」S2。
+name: Env Then Echo
+on: push
+
+permissions:
+  contents: read
+
+jobs:
+  leak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+      - name: Print token
+        env:
+          MY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: echo "token is $MY_TOKEN"

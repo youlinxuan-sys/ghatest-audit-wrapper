@@ -1,0 +1,16 @@
+# nit 4 fixture：uses: 完全沒有 @ref。
+# 舊版 H3 遇到沒有 @ 的 ref 直接 continue 跳過 → 漏報。
+# 新版應抓出 H3（action 沒有 @<ref>，等同隱性追最新版）。
+name: Missing Ref
+on: push
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout
+      - run: echo build
