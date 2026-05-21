@@ -13,4 +13,5 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
-      - run: curl -H "Authorization: ${{ secrets.API_KEY }}" https://example.com
+      - run: |
+          curl -H "Authorization: ${{ secrets.API_KEY }}" https://example.com

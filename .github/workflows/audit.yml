@@ -20,6 +20,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
 
+      - name: Install PyYAML
+        run: pip install --quiet pyyaml
+
       - name: Audit real workflows
         id: audit_real
         run: |

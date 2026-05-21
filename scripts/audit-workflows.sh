@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # audit-workflows.sh
 #
-# 靜態 audit GitHub Actions workflow YAML，輸出 unified markdown report。
+# 靜態 audit GitHub Actions workflow YAML，輸出 unified report。
 # 涵蓋兩類風險：
-#   1. Hardening — 缺 timeout-minutes / permissions、floating action refs (@main, @v4)
-#   2. Secret exposure — pull_request_target + secrets 同框、echo secret、unpinned action 收 secret
+#   1. Hardening — 缺 timeout-minutes / permissions、floating 或缺失的 action ref
+#   2. Secret exposure — pull_request_target + secrets 同框、echo secret、hardcoded credential
+#
+# 用 PyYAML 真正 parse workflow（不再用 regex 假裝解析），所以 quoted key、
+# 跨行陣列、key order、註解、跳脫引號這些 YAML 合法寫法都自然處理掉。
+#
+# 依賴：python3 + PyYAML。CI 會在跑 audit 前 pip install pyyaml。
 #
 # Env vars:
 #   WORKFLOW_GLOB        default: .github/workflows/*.y*ml
@@ -16,7 +21,7 @@
 # Exit codes:
 #   0 — clean OR FAIL_ON_CRITICAL=0
 #   2 — critical findings AND FAIL_ON_CRITICAL=1
-#   3 — invalid input / no workflow files matched
+#   3 — invalid input / no workflow files matched / PyYAML 不可用
 
 set -euo pipefail
 
@@ -33,14 +38,14 @@ if [[ ! -e "${FILES[0]:-}" ]]; then
   exit 3
 fi
 
-# sentinel 檔放 mktemp 暫存區，不污染 cwd（nit 6）。trap 確保結束時清掉。
+# sentinel 檔放 mktemp 暫存區，不污染 cwd。trap 確保結束時清掉。
 SENTINEL="$(mktemp -t audit-critical.XXXXXX)"
 trap 'rm -f "$SENTINEL"' EXIT
 
 python3 - "$OUTPUT_FORMAT" "$WARN_SCORE" "$CRITICAL_SCORE" "$SENTINEL" "${FILES[@]}" <<'PYEOF'
+import json
 import re
 import sys
-import json
 from pathlib import Path
 
 VALID_FORMATS = {"text", "markdown", "json"}
@@ -51,7 +56,7 @@ critical_score = int(sys.argv[3])
 sentinel_path = Path(sys.argv[4])
 files = [Path(p) for p in sys.argv[5:]]
 
-# nit 5: OUTPUT_FORMAT 拼錯要 fail fast，不要默默落回 markdown
+# OUTPUT_FORMAT 拼錯 fail fast，不默默落回 markdown
 if output_format not in VALID_FORMATS:
     sys.stderr.write(
         f"invalid OUTPUT_FORMAT: {output_format!r} "
@@ -59,167 +64,104 @@ if output_format not in VALID_FORMATS:
     )
     sys.exit(3)
 
-# --- Patterns ---
-# nit 2: pull_request_target 兩種寫法都要抓 —
-#   block 形式  on:\n  pull_request_target:
-#   shorthand   on: [pull_request_target]  /  on: pull_request_target
-RE_PR_TARGET = re.compile(r"\bpull_request_target\b")
+try:
+    import yaml
+except ImportError:
+    sys.stderr.write(
+        "PyYAML 不可用 —— 請先 `pip install pyyaml`。\n"
+    )
+    sys.exit(3)
+
+
+# ---- Patterns（只用於掃 run 字串內容，不用來解析 YAML 結構）----
 RE_SECRETS_REF = re.compile(r"\$\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}")
 RE_ECHO_SECRET = re.compile(
     r"\b(echo|printf|tee|set-output)\b[^\n]*\$\{\{\s*secrets\.", re.IGNORECASE
 )
-RE_USES = re.compile(r"^\s*-?\s*uses:\s*([^\s#]+)", re.MULTILINE)
-RE_TIMEOUT = re.compile(r"^\s*timeout-minutes\s*:", re.MULTILINE)
-RE_PERMISSIONS = re.compile(r"^\s*permissions\s*:", re.MULTILINE)
-RE_JOBS_BLOCK = re.compile(r"^jobs\s*:\s*$", re.MULTILINE)
+RE_ECHO_LINE = re.compile(r"\b(echo|printf|tee)\b[^\n]*", re.IGNORECASE)
 RE_HARDCODED = re.compile(
     r"(token|password|api[_-]?key|secret)\s*[:=]\s*['\"]?[A-Za-z0-9_\-]{16,}",
     re.IGNORECASE,
 )
-
 FLOATING_REF_RE = re.compile(r"@(main|master|latest|v\d+)$")
 
-# nit 3: env-then-echo —— `env:` 把 secret 存進變數，後面 run 再 echo $VAR。
-#   先抓 env mapping：    VAR_NAME: ${{ secrets.X }}
-#   再看 shell 有沒有引用 $VAR_NAME / ${VAR_NAME}
-RE_ENV_SECRET_MAP = re.compile(
-    r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*\$\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}",
-    re.MULTILINE,
-)
-RE_ECHO_LINE = re.compile(
-    r"\b(echo|printf|tee)\b[^\n]*", re.IGNORECASE
-)
 
+def best_effort_line(raw: str, needle: str) -> int | None:
+    """在原始檔內容找 needle 第一次出現的行號（1-based）。
 
-def split_jobs(text: str) -> list:
-    """把 `jobs:` 區塊底下每個 job 切成 (job_name, job_body) list。
-
-    純 regex / 縮排切割（保持零依賴）。GitHub Actions YAML 強制
-    job 名稱固定縮一級、step 等內容縮更深，所以靠縮排切是穩的。
-    切不出來（無 jobs: 或格式怪）回空 list。
+    PyYAML safe_load 不保留行號，所以 secret echo 這類需要行號的 finding
+    用「回原文搜字串」補回。找不到回 None（呼叫端就不標行號）。
+    needle 內容重複時只標第一處 —— best-effort，可接受。
     """
-    m = RE_JOBS_BLOCK.search(text)
-    if not m:
+    idx = raw.find(needle)
+    if idx < 0:
+        return None
+    return raw[:idx].count("\n") + 1
+
+
+def as_list(v) -> list:
+    """把 YAML 值正規化成 list —— scalar 包成單元素 list、None 回空 list。"""
+    if v is None:
         return []
-    lines = text[m.end():].splitlines()
-    # 找第一個 job 名稱行的縮排深度當基準
-    job_indent = None
-    for ln in lines:
-        if not ln.strip() or ln.lstrip().startswith("#"):
-            continue
-        indent = len(ln) - len(ln.lstrip())
-        if indent == 0:  # 已經離開 jobs: 區塊
-            return []
-        job_indent = indent
-        break
-    if job_indent is None:
-        return []
+    if isinstance(v, list):
+        return v
+    return [v]
 
-    jobs = []
-    cur_name = None
-    cur_body: list = []
-    for ln in lines:
-        stripped = ln.strip()
-        indent = len(ln) - len(ln.lstrip())
-        # 縮排回到 0 且非空 → jobs: 區塊結束
-        if stripped and indent == 0:
-            break
-        # job 名稱行：剛好 job_indent 縮排、以冒號結尾
-        if (indent == job_indent and stripped
-                and not stripped.startswith("#")
-                and re.match(r"^[A-Za-z0-9_\-]+\s*:\s*$", stripped)):
-            if cur_name is not None:
-                jobs.append((cur_name, "\n".join(cur_body)))
-            cur_name = stripped.rstrip(":").strip()
-            cur_body = []
-        elif cur_name is not None:
-            cur_body.append(ln)
-    if cur_name is not None:
-        jobs.append((cur_name, "\n".join(cur_body)))
-    return jobs
 
-def strip_comments(text: str) -> str:
-    """逐行剝掉 YAML 註解（# 之後到行尾），保留行結構（換行不動）。
+def collect_secret_env_vars(env) -> set:
+    """從一個 env: mapping 收出『值是 ${{ secrets.* }}』的變數名。"""
+    out = set()
+    if isinstance(env, dict):
+        for k, v in env.items():
+            if isinstance(v, str) and RE_SECRETS_REF.search(v):
+                out.add(str(k))
+    return out
 
-    為避免剝掉字串內的 # （如 `run: echo "a#b"`），用簡單的引號狀態機：
-    在引號內的 # 不算註解。夠用於 GitHub Actions workflow。
-    """
+
+def iter_uses(steps) -> list:
+    """從 steps list 收出所有 `uses` 值。"""
     out = []
-    for ln in text.splitlines():
-        in_s = in_d = False
-        cut = None
-        for i, ch in enumerate(ln):
-            if ch == "'" and not in_d:
-                in_s = not in_s
-            elif ch == '"' and not in_s:
-                in_d = not in_d
-            elif ch == "#" and not in_s and not in_d:
-                cut = i
-                break
-        out.append(ln if cut is None else ln[:cut])
-    return "\n".join(out)
-
-
-def top_level_block(text: str) -> str:
-    """回傳 `jobs:` 之前的內容 —— 即 workflow top-level 區塊。
-
-    top-level permissions / on 都在這裡。沒有 jobs: 就回整份。
-    """
-    m = RE_JOBS_BLOCK.search(text)
-    return text[:m.start()] if m else text
-
-
-def on_block(text: str) -> str:
-    """抽出 `on:` 區塊內容（含 inline 與 block 兩種寫法）。
-
-    - inline： `on: push` / `on: [push, pull_request_target]` → 回那一行
-    - block：  `on:\\n  pull_request_target:\\n    ...`        → 回整段
-    抽不到回空字串。用於把 pull_request_target 判斷限縮在 on: 區塊（nit 2 修正）。
-    """
-    lines = text.splitlines()
-    for idx, ln in enumerate(lines):
-        m = re.match(r"^(on)\s*:(.*)$", ln)
-        if not m:
-            continue
-        rest = m.group(2).strip()
-        if rest:  # inline 形式，值在同一行
-            return rest
-        # block 形式：往下收縮排比 `on:` 深的行
-        block = []
-        for nxt in lines[idx + 1:]:
-            if not nxt.strip():
-                block.append(nxt)
-                continue
-            indent = len(nxt) - len(nxt.lstrip())
-            if indent == 0:  # 回到 top-level，on: 區塊結束
-                break
-            block.append(nxt)
-        return "\n".join(block)
-    return ""
+    for step in steps or []:
+        if isinstance(step, dict) and "uses" in step:
+            val = step["uses"]
+            if isinstance(val, str):
+                out.append(val)
+    return out
 
 
 def audit_file(path: Path) -> dict:
     raw = path.read_text(encoding="utf-8", errors="replace")
-    # 大部分規則跑在「剝掉註解」的版本上，避免註解內容誤觸發（nit 2 等）。
-    # 行號仍用 raw 算（strip_comments 不改行數），所以行號維持正確。
-    text = strip_comments(raw)
     findings = []
     score = 0
 
-    has_jobs = bool(RE_JOBS_BLOCK.search(text))
-    # nit 修正：top-level permissions 只看 jobs: 之前，不是全檔
-    # （job-level permissions 不該被當成 top-level）。
-    has_top_perms = bool(RE_PERMISSIONS.search(top_level_block(text)))
-    jobs = split_jobs(text)
+    # ---- parse YAML ----
+    try:
+        doc = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        # 語法錯的 workflow：報一個 warn，不 crash、不誤判成 clean
+        findings.append(("warn", "P0",
+            f"YAML 解析失敗，無法 audit —— {str(e).splitlines()[0]}"))
+        return _result(path, 1, findings)
 
-    # H1/H2: permissions / timeout-minutes —— 逐 job 檢查（nit 1）。
-    # 一個 job 在 job body 沒設、且 workflow top-level 也沒設 → 才算缺。
-    # （top-level 設了會被所有 job 繼承，所以 top-level 有就全 job 過。）
-    if has_jobs and jobs:
-        for job_name, body in jobs:
-            job_has_perms = bool(RE_PERMISSIONS.search(body))
-            job_has_timeout = bool(RE_TIMEOUT.search(body))
-            if not has_top_perms and not job_has_perms:
+    if not isinstance(doc, dict):
+        findings.append(("warn", "P0",
+            "workflow 最外層不是 mapping，無法 audit"))
+        return _result(path, 1, findings)
+
+    # PyYAML 會把未加引號的 `on:` 解析成 boolean True（YAML 1.1 坑）。
+    # workflow 真正的 on key 因此可能是字串 "on" 或 boolean True，兩個都看。
+    on_value = doc.get("on", doc.get(True))
+    top_perms = "permissions" in doc
+    jobs = doc.get("jobs")
+
+    # ---- H1 / H2：逐 job 檢查 permissions / timeout-minutes ----
+    if isinstance(jobs, dict):
+        for job_name, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            job_has_perms = "permissions" in job
+            job_has_timeout = "timeout-minutes" in job
+            if not top_perms and not job_has_perms:
                 findings.append(("warn", "H1",
                     f"job `{job_name}` 缺 `permissions:`（workflow-level 也沒設）— "
                     "預設拿到 read+write 的 GITHUB_TOKEN，建議顯式宣告最小權限"))
@@ -229,35 +171,22 @@ def audit_file(path: Path) -> dict:
                     f"job `{job_name}` 缺 `timeout-minutes` — "
                     "失控 job 可能跑滿 6 小時 quota，建議設 15-30 分鐘"))
                 score += 2
-    elif has_jobs:
-        # 有 jobs: 但切不出 job（格式異常）— 退回全檔粗檢，至少不漏報
-        if not has_top_perms:
-            findings.append(("warn", "H1",
-                "缺 workflow-level `permissions:` — 建議顯式宣告最小權限"))
-            score += 2
-        if not RE_TIMEOUT.search(text):
-            findings.append(("warn", "H2",
-                "缺 `timeout-minutes` — 建議設 15-30 分鐘"))
-            score += 2
 
-    # H3: floating action refs + missing ref（nit 4）
-    floating = []
-    missing_ref = []
-    for m in RE_USES.finditer(text):
-        ref = m.group(1)
-        # nit 修正：先剝掉成對引號 —— uses 的值可能寫成 './x' 或 "docker://y"，
-        # 不剝引號的話 startswith 判斷會失效、誤報 missing ref。
-        if len(ref) >= 2 and ref[0] == ref[-1] and ref[0] in ("'", '"'):
-            ref = ref[1:-1]
-        # 本地 action（./ 開頭）跟 docker:// 不適用 ref 規則
-        if ref.startswith("./") or ref.startswith("docker://"):
-            continue
-        if "@" not in ref:
-            # nit 4: `uses: actions/checkout` 沒有 @ref —— 抓不到版本、隱性 floating
-            missing_ref.append(ref)
-            continue
-        if FLOATING_REF_RE.search(ref):
-            floating.append(ref)
+    # ---- H3：floating / missing action ref ----
+    floating, missing_ref = [], []
+    if isinstance(jobs, dict):
+        for job in jobs.values():
+            if not isinstance(job, dict):
+                continue
+            for ref in iter_uses(job.get("steps")):
+                # 本地 action / docker action 不適用 ref 規則
+                if ref.startswith("./") or ref.startswith("docker://"):
+                    continue
+                if "@" not in ref:
+                    missing_ref.append(ref)
+                    continue
+                if FLOATING_REF_RE.search(ref):
+                    floating.append(ref)
     for ref in sorted(set(floating)):
         findings.append(("warn", "H3",
             f"floating action ref: `{ref}` — 建議 pin SHA 或 specific patch tag"))
@@ -267,60 +196,80 @@ def audit_file(path: Path) -> dict:
             f"action `{ref}` 沒有 `@<ref>` — 等同隱性追最新版，建議 pin SHA"))
         score += 1
 
-    # S1: pull_request_target + secrets
-    # nit 修正：pull_request_target 只在 on: 區塊裡才算數，
-    # 避免註解 / 其他字串裡提到這個字被誤判（false positive）。
-    if RE_PR_TARGET.search(on_block(text)) and RE_SECRETS_REF.search(text):
+    # ---- S1：pull_request_target + secrets ----
+    on_keys = []
+    if isinstance(on_value, dict):
+        on_keys = [str(k) for k in on_value.keys()]
+    else:
+        on_keys = [str(x) for x in as_list(on_value)]
+    has_pr_target = "pull_request_target" in on_keys
+    has_secret_ref = bool(RE_SECRETS_REF.search(raw))
+    if has_pr_target and has_secret_ref:
         findings.append(("critical", "S1",
-            "`pull_request_target` 同時引用 `${{ secrets.* }}` — 可被 fork PR 利用偷 secret，極高風險"))
+            "`pull_request_target` 同時引用 `${{ secrets.* }}` — "
+            "可被 fork PR 利用偷 secret，極高風險"))
         score += 6
 
-    # S2: echo / printf / tee secret —— 直接形式（echo ${{ secrets.X }}）
-    for m in RE_ECHO_SECRET.finditer(text):
-        line_no = text[:m.start()].count("\n") + 1
-        findings.append(("critical", "S2",
-            f"L{line_no}: 在 shell 輸出 secret 表達式 — secret 會落 log"))
-        score += 4
+    # ---- S2：secret 落 log（直接 echo + env-then-echo）----
+    # 走 parse 後的 step 結構：env scope 精確到 step（step env 不流到下一個
+    # step），job-level env 對該 job 所有 step 生效。
+    if isinstance(jobs, dict):
+        for job in jobs.values():
+            if not isinstance(job, dict):
+                continue
+            job_env_vars = collect_secret_env_vars(job.get("env"))
+            for step in as_list(job.get("steps")):
+                if not isinstance(step, dict):
+                    continue
+                run = step.get("run")
+                if not isinstance(run, str):
+                    continue
+                # 該 step 可見的 secret env 變數 = job-level + 該 step env
+                step_env_vars = job_env_vars | collect_secret_env_vars(
+                    step.get("env"))
 
-    # S2: env-then-echo —— 間接形式（nit 3）。
-    # env: 把 secret 存進變數，後面 echo $VAR 一樣會把 secret 印進 log。
-    # nit 修正：env 變數有 scope —— 在【同一個 job body 內】抓 env 變數、
-    # 也在同一個 job body 內找 echo，不跨 job 比對（避免 false positive）。
-    # 切不出 job 時退回全檔（至少不漏報）。
-    scopes = [body for _, body in jobs] if jobs else [text]
-    # 行號要對回 raw —— 用每個 scope 在 text 裡的起始位置換算
-    for scope in scopes:
-        env_secret_vars = {m.group(1) for m in RE_ENV_SECRET_MAP.finditer(scope)}
-        if not env_secret_vars:
-            continue
-        scope_start = text.find(scope)
-        for m in RE_ECHO_LINE.finditer(scope):
-            echo_line = m.group(0)
-            for var in env_secret_vars:
-                # 抓 $VAR 或 ${VAR}（用 \b 與邊界避免 VAR 是另一變數的前綴）
-                if re.search(r"\$\{?" + re.escape(var) + r"\b\}?", echo_line):
-                    abs_pos = scope_start + m.start() if scope_start >= 0 else m.start()
-                    line_no = text[:abs_pos].count("\n") + 1
+                # S2a：run 內直接出現 ${{ secrets.* }}
+                if RE_ECHO_SECRET.search(run):
+                    ln = best_effort_line(raw, run.strip().splitlines()[0])
+                    loc = f"L{ln}: " if ln else ""
                     findings.append(("critical", "S2",
-                        f"L{line_no}: echo `${var}` — 該變數由 env 綁定 "
-                        f"`${{{{ secrets.* }}}}`，secret 會間接落 log"))
+                        f"{loc}在 shell 輸出 secret 表達式 — secret 會落 log"))
                     score += 4
-                    break
 
-    # S3: hardcoded credential-looking value
-    for m in RE_HARDCODED.finditer(text):
-        # exclude obvious env: secrets.X mapping
+                # S2b：env-then-echo —— echo 引用了綁 secret 的 env 變數
+                for em in RE_ECHO_LINE.finditer(run):
+                    echo_line = em.group(0)
+                    for var in step_env_vars:
+                        if re.search(r"\$\{?" + re.escape(var) + r"\b\}?",
+                                     echo_line):
+                            ln = best_effort_line(raw, echo_line.strip())
+                            loc = f"L{ln}: " if ln else ""
+                            findings.append(("critical", "S2",
+                                f"{loc}echo `${var}` — 該變數由 env 綁定 "
+                                f"`${{{{ secrets.* }}}}`，secret 會間接落 log"))
+                            score += 4
+                            break
+
+    # ---- S3：hardcoded credential ----
+    for m in RE_HARDCODED.finditer(raw):
         snippet = m.group(0)
-        if "secrets." in text[max(0, m.start()-20):m.end()+5]:
+        # 排除 env: KEY: ${{ secrets.X }} 這種正常映射
+        if "secrets." in raw[max(0, m.start() - 20):m.end() + 5]:
             continue
-        line_no = text[:m.start()].count("\n") + 1
+        ln = raw[:m.start()].count("\n") + 1
         findings.append(("warn", "S3",
-            f"L{line_no}: 看起來像 hardcoded credential — `{snippet[:40]}...`"))
+            f"L{ln}: 看起來像 hardcoded credential — `{snippet[:40]}...`"))
         score += 3
 
-    # severity：取「finding 自身級別」與「分數門檻」兩者的較重者。
-    # 修正先前 bug —— 有 critical finding 卻因分數沒到門檻被歸成 warn/ok。
-    # 分數門檻只能往上加重（多個 warn 累積成 critical），不能往下蓋過 finding 級別。
+    return _result(path, score, findings)
+
+
+def _result(path: Path, score: int, findings: list) -> dict:
+    """組 finding list → 結果 dict，並算 severity。
+
+    severity 取「finding 自身級別」與「分數門檻」較重者 —— 分數門檻只能
+    往上加重（多個 warn 累積成 critical），不能把 critical finding 降級。
+    """
     levels = {f[0] for f in findings}
     if "critical" in levels:
         severity = "critical"
@@ -332,7 +281,6 @@ def audit_file(path: Path) -> dict:
         severity = "critical"
     elif score >= warn_score and severity == "ok":
         severity = "warn"
-
     return {
         "file": str(path),
         "score": score,
@@ -343,11 +291,13 @@ def audit_file(path: Path) -> dict:
         ],
     }
 
+
 results = [audit_file(p) for p in files]
 overall_critical = any(r["severity"] == "critical" for r in results)
 
 if output_format == "json":
-    print(json.dumps({"results": results, "critical": overall_critical}, ensure_ascii=False, indent=2))
+    print(json.dumps({"results": results, "critical": overall_critical},
+                     ensure_ascii=False, indent=2))
 elif output_format == "text":
     for r in results:
         print(f"[{r['severity'].upper()}] {r['file']} (score={r['score']})")
@@ -359,7 +309,8 @@ else:  # markdown
     counts = {"ok": 0, "warn": 0, "critical": 0}
     for r in results:
         counts[r["severity"]] += 1
-    print(f"**Summary**: {counts['critical']} critical · {counts['warn']} warn · {counts['ok']} clean")
+    print(f"**Summary**: {counts['critical']} critical · "
+          f"{counts['warn']} warn · {counts['ok']} clean")
     print()
     if overall_critical:
         print("> 🚨 至少一個 workflow 有 **critical** 級別發現，merge 前必須處理。")
@@ -381,9 +332,10 @@ else:  # markdown
         print()
     print("---")
     print()
-    print("**Codes**: H1=permissions / H2=timeout / H3=floating-ref · S1=pr_target+secrets / S2=echo-secret / S3=hardcoded")
+    print("**Codes**: H1=permissions / H2=timeout / H3=floating-ref · "
+          "S1=pr_target+secrets / S2=echo-secret / S3=hardcoded · P0=parse-error")
 
-# Signal to bash via sentinel file (subprocess return code is limited)
+# Signal to bash via sentinel file
 sentinel_path.write_text("1" if overall_critical else "0")
 PYEOF
 

@@ -4,7 +4,7 @@ GitHub Actions workflow 安全 audit 工具。單一 scanner，把 workflow YAML
 
 ## 動機
 
-GitHub Actions workflow 預設不安全：缺 `timeout-minutes`、`permissions` 寫太鬆、`uses: foo@main` 浮動 ref、`pull_request_target` 配 `${{ secrets.* }}` 等。`./scripts/audit-workflows.sh` 是一支零依賴（純 bash + Python 標準庫）的 unified scanner，涵蓋兩類規則：
+GitHub Actions workflow 預設不安全：缺 `timeout-minutes`、`permissions` 寫太鬆、`uses: foo@main` 浮動 ref、`pull_request_target` 配 `${{ secrets.* }}` 等。`./scripts/audit-workflows.sh` 是一支 unified scanner，用 PyYAML 真正 parse workflow（不靠 regex 猜結構，所以 quoted key、跨行陣列、key order 等 YAML 合法寫法都正確處理），涵蓋兩類規則：
 
 - **Hardening (H1-H3)** — 逐 job 檢查缺 `permissions` / `timeout-minutes`、floating 或缺失的 action ref
 - **Secret exposure (S1-S3)** — `pull_request_target` 配 secret、shell echo secret（含 env-then-echo 間接形式）、hardcoded credential
@@ -32,6 +32,16 @@ GitHub Actions workflow 預設不安全：缺 `timeout-minutes`、`permissions` 
 - 所有改動走 PR
 - linear history
 - status checks（audit workflow）必須通過
+
+## 依賴
+
+`python3` + `PyYAML`。本機跑前先裝：
+
+```bash
+pip install pyyaml
+```
+
+CI 已在 audit 步驟前自動 `pip install pyyaml`，不需手動處理。
 
 ## 使用
 

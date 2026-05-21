@@ -19,7 +19,8 @@ jobs:
       - name: Use token safely
         env:
           TOKEN: ${{ secrets.API_TOKEN }}
-        run: curl -H "Authorization: $TOKEN" https://example.com
+        run: |
+          curl -H "Authorization: $TOKEN" https://example.com
 
   job_b:
     runs-on: ubuntu-latest
