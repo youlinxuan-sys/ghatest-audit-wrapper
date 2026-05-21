@@ -1,0 +1,23 @@
+# nit 1 fixture：沒有 workflow-level permissions，但每個 job 各自設了。
+# 新版 H1 應【不】誤報 —— job-level permissions 已足夠，top-level 缺不算問題。
+name: Job Level Perms
+on: push
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+      - run: echo build
+
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+      - run: echo release

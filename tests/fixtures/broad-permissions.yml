@@ -1,0 +1,16 @@
+# 額外 fixture：workflow-level permissions: write-all。
+# 雖然有設 permissions（H1 不報），但設成 write-all 等於沒收斂。
+# 目前 audit 規則只看「有沒有設 permissions」、不看內容，所以這個 fixture
+# 預期 H1 不報 —— 留作未來規則擴充（偵測 write-all）的基準參照。
+name: Broad Permissions
+on: push
+
+permissions: write-all
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+      - run: echo build

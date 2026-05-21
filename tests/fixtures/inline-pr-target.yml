@@ -1,0 +1,16 @@
+# nit 2 fixture：pull_request_target 用 shorthand 陣列寫法。
+# 舊版 RE_PR_TARGET 只抓行首形式，這種 on: [pull_request_target] 漏抓。
+# 新版應抓出 S1（pull_request_target + secrets 同框）。
+name: Inline PR Target
+on: [push, pull_request_target]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+      - run: curl -H "Authorization: ${{ secrets.API_KEY }}" https://example.com

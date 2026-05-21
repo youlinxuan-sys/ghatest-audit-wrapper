@@ -1,15 +1,15 @@
 # ghatest-audit-wrapper
 
-GitHub Actions workflow 安全 audit 的 wrapper 工具。包兩個 audit 來源成一個 PR comment 友善的 markdown report。
+GitHub Actions workflow 安全 audit 工具。單一 scanner，把 workflow YAML 的安全問題掃成一份 PR comment 友善的 markdown report。
 
 ## 動機
 
-GitHub Actions workflow 預設不安全：缺 `timeout-minutes`、`permissions` 寫太鬆、`uses: foo@main` 浮動 ref、`pull_request_target` 配 `${{ secrets.* }}` 等。這支工具把兩類靜態 audit 包成 `./scripts/audit-workflows.sh`：
+GitHub Actions workflow 預設不安全：缺 `timeout-minutes`、`permissions` 寫太鬆、`uses: foo@main` 浮動 ref、`pull_request_target` 配 `${{ secrets.* }}` 等。`./scripts/audit-workflows.sh` 是一支零依賴（純 bash + Python 標準庫）的 unified scanner，涵蓋兩類規則：
 
-- **Hardening audit** — 抓缺 timeout/permissions/concurrency、floating action ref
-- **Secret exposure audit** — 抓 secret echo、unpinned action 收 secret、hardcoded credential
+- **Hardening (H1-H3)** — 逐 job 檢查缺 `permissions` / `timeout-minutes`、floating 或缺失的 action ref
+- **Secret exposure (S1-S3)** — `pull_request_target` 配 secret、shell echo secret（含 env-then-echo 間接形式）、hardcoded credential
 
-兩份報告合併輸出 unified markdown，可直接貼 PR comment 或當 CI fail gate。
+輸出 `markdown` / `text` / `json` 三種格式，可直接貼 PR comment 或當 CI fail gate（`FAIL_ON_CRITICAL=1`）。
 
 ## 三方協作 flow（這個 repo 用的）
 
@@ -36,11 +36,24 @@ GitHub Actions workflow 預設不安全：缺 `timeout-minutes`、`permissions` 
 ## 使用
 
 ```bash
+# 預設掃 .github/workflows/*.y*ml、輸出 markdown
 ./scripts/audit-workflows.sh
+
+# 換格式 / 指定掃描範圍 / 開 critical fail gate
+OUTPUT_FORMAT=text ./scripts/audit-workflows.sh
+WORKFLOW_GLOB='tests/fixtures/*.yml' ./scripts/audit-workflows.sh
+FAIL_ON_CRITICAL=1 ./scripts/audit-workflows.sh   # 有 critical 時 exit 2
 ```
 
-（後續 PR 補 scaffold；目前為佔位）
+| Env var | 預設 | 說明 |
+|---|---|---|
+| `WORKFLOW_GLOB` | `.github/workflows/*.y*ml` | 要掃的檔案 glob |
+| `OUTPUT_FORMAT` | `markdown` | `markdown` / `text` / `json`，拼錯會 fail fast |
+| `FAIL_ON_CRITICAL` | `0` | `1` = 有 critical 發現時 exit 2 |
+| `WARN_SCORE` / `CRITICAL_SCORE` | `3` / `7` | severity 分數門檻 |
+
+`tests/fixtures/` 下有 10 個 workflow fixture，涵蓋各條規則的正反案例，CI 每次跑會對它們做 sanity check。
 
 ## 狀態
 
-🌱 初始化階段。第一個 PR 會帶入 audit script + GitHub Actions workflow。
+🟢 運行中。audit script + CI workflow 已就緒，自己的 workflow 由自己 audit（dogfood）。
