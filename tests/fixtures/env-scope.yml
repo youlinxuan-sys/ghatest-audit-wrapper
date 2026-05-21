@@ -1,0 +1,32 @@
+# bug 3 fixture：job A 設 env secret 變數、job B echo 同名變數。
+# 修正前 env_secret_vars 全檔 scope → job B 的 echo $TOKEN 被誤判 leak。
+# 修正後 env 變數 per-job scope → job B 沒有自己的 env secret，
+# 它的 echo $TOKEN 不該報 S2（job B 的 TOKEN 是未綁定的一般變數）。
+# 整體應只有 job A 真的 leak 嗎？job A 只設 env、沒 echo → job A 也不報。
+# 預期：整份 OK，沒有 S2。
+name: Env Scope
+on: push
+
+permissions:
+  contents: read
+
+jobs:
+  job_a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+      - name: Use token safely
+        env:
+          TOKEN: ${{ secrets.API_TOKEN }}
+        run: curl -H "Authorization: $TOKEN" https://example.com
+
+  job_b:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+      - name: Print a non-secret var
+        run: |
+          TOKEN=hello
+          echo "value is $TOKEN"

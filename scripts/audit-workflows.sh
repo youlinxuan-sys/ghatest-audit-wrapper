@@ -138,13 +138,78 @@ def split_jobs(text: str) -> list:
         jobs.append((cur_name, "\n".join(cur_body)))
     return jobs
 
+def strip_comments(text: str) -> str:
+    """逐行剝掉 YAML 註解（# 之後到行尾），保留行結構（換行不動）。
+
+    為避免剝掉字串內的 # （如 `run: echo "a#b"`），用簡單的引號狀態機：
+    在引號內的 # 不算註解。夠用於 GitHub Actions workflow。
+    """
+    out = []
+    for ln in text.splitlines():
+        in_s = in_d = False
+        cut = None
+        for i, ch in enumerate(ln):
+            if ch == "'" and not in_d:
+                in_s = not in_s
+            elif ch == '"' and not in_s:
+                in_d = not in_d
+            elif ch == "#" and not in_s and not in_d:
+                cut = i
+                break
+        out.append(ln if cut is None else ln[:cut])
+    return "\n".join(out)
+
+
+def top_level_block(text: str) -> str:
+    """回傳 `jobs:` 之前的內容 —— 即 workflow top-level 區塊。
+
+    top-level permissions / on 都在這裡。沒有 jobs: 就回整份。
+    """
+    m = RE_JOBS_BLOCK.search(text)
+    return text[:m.start()] if m else text
+
+
+def on_block(text: str) -> str:
+    """抽出 `on:` 區塊內容（含 inline 與 block 兩種寫法）。
+
+    - inline： `on: push` / `on: [push, pull_request_target]` → 回那一行
+    - block：  `on:\\n  pull_request_target:\\n    ...`        → 回整段
+    抽不到回空字串。用於把 pull_request_target 判斷限縮在 on: 區塊（nit 2 修正）。
+    """
+    lines = text.splitlines()
+    for idx, ln in enumerate(lines):
+        m = re.match(r"^(on)\s*:(.*)$", ln)
+        if not m:
+            continue
+        rest = m.group(2).strip()
+        if rest:  # inline 形式，值在同一行
+            return rest
+        # block 形式：往下收縮排比 `on:` 深的行
+        block = []
+        for nxt in lines[idx + 1:]:
+            if not nxt.strip():
+                block.append(nxt)
+                continue
+            indent = len(nxt) - len(nxt.lstrip())
+            if indent == 0:  # 回到 top-level，on: 區塊結束
+                break
+            block.append(nxt)
+        return "\n".join(block)
+    return ""
+
+
 def audit_file(path: Path) -> dict:
-    text = path.read_text(encoding="utf-8", errors="replace")
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    # 大部分規則跑在「剝掉註解」的版本上，避免註解內容誤觸發（nit 2 等）。
+    # 行號仍用 raw 算（strip_comments 不改行數），所以行號維持正確。
+    text = strip_comments(raw)
     findings = []
     score = 0
 
     has_jobs = bool(RE_JOBS_BLOCK.search(text))
-    has_top_perms = bool(RE_PERMISSIONS.search(text))
+    # nit 修正：top-level permissions 只看 jobs: 之前，不是全檔
+    # （job-level permissions 不該被當成 top-level）。
+    has_top_perms = bool(RE_PERMISSIONS.search(top_level_block(text)))
     jobs = split_jobs(text)
 
     # H1/H2: permissions / timeout-minutes —— 逐 job 檢查（nit 1）。
@@ -180,6 +245,10 @@ def audit_file(path: Path) -> dict:
     missing_ref = []
     for m in RE_USES.finditer(text):
         ref = m.group(1)
+        # nit 修正：先剝掉成對引號 —— uses 的值可能寫成 './x' 或 "docker://y"，
+        # 不剝引號的話 startswith 判斷會失效、誤報 missing ref。
+        if len(ref) >= 2 and ref[0] == ref[-1] and ref[0] in ("'", '"'):
+            ref = ref[1:-1]
         # 本地 action（./ 開頭）跟 docker:// 不適用 ref 規則
         if ref.startswith("./") or ref.startswith("docker://"):
             continue
@@ -199,7 +268,9 @@ def audit_file(path: Path) -> dict:
         score += 1
 
     # S1: pull_request_target + secrets
-    if RE_PR_TARGET.search(text) and RE_SECRETS_REF.search(text):
+    # nit 修正：pull_request_target 只在 on: 區塊裡才算數，
+    # 避免註解 / 其他字串裡提到這個字被誤判（false positive）。
+    if RE_PR_TARGET.search(on_block(text)) and RE_SECRETS_REF.search(text):
         findings.append(("critical", "S1",
             "`pull_request_target` 同時引用 `${{ secrets.* }}` — 可被 fork PR 利用偷 secret，極高風險"))
         score += 6
@@ -213,14 +284,23 @@ def audit_file(path: Path) -> dict:
 
     # S2: env-then-echo —— 間接形式（nit 3）。
     # env: 把 secret 存進變數，後面 echo $VAR 一樣會把 secret 印進 log。
-    env_secret_vars = {m.group(1) for m in RE_ENV_SECRET_MAP.finditer(text)}
-    if env_secret_vars:
-        for m in RE_ECHO_LINE.finditer(text):
+    # nit 修正：env 變數有 scope —— 在【同一個 job body 內】抓 env 變數、
+    # 也在同一個 job body 內找 echo，不跨 job 比對（避免 false positive）。
+    # 切不出 job 時退回全檔（至少不漏報）。
+    scopes = [body for _, body in jobs] if jobs else [text]
+    # 行號要對回 raw —— 用每個 scope 在 text 裡的起始位置換算
+    for scope in scopes:
+        env_secret_vars = {m.group(1) for m in RE_ENV_SECRET_MAP.finditer(scope)}
+        if not env_secret_vars:
+            continue
+        scope_start = text.find(scope)
+        for m in RE_ECHO_LINE.finditer(scope):
             echo_line = m.group(0)
             for var in env_secret_vars:
                 # 抓 $VAR 或 ${VAR}（用 \b 與邊界避免 VAR 是另一變數的前綴）
                 if re.search(r"\$\{?" + re.escape(var) + r"\b\}?", echo_line):
-                    line_no = text[:m.start()].count("\n") + 1
+                    abs_pos = scope_start + m.start() if scope_start >= 0 else m.start()
+                    line_no = text[:abs_pos].count("\n") + 1
                     findings.append(("critical", "S2",
                         f"L{line_no}: echo `${var}` — 該變數由 env 綁定 "
                         f"`${{{{ secrets.* }}}}`，secret 會間接落 log"))

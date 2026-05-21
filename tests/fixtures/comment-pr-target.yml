@@ -1,0 +1,21 @@
+# bug 2 fixture：on: push（正常），但註解裡提到 pull_request_target。
+# 修正前 RE_PR_TARGET 掃全檔 → 註解命中 + 有 secrets 引用 → 誤打 critical S1。
+# 修正後 pull_request_target 只在 on: 區塊判斷 → 應【不】報 S1。
+# 註：本檔故意有 secrets 引用，但沒有 pull_request_target，整體應是 OK。
+name: Comment PR Target
+# 這個 workflow 不使用 pull_request_target，純 push 觸發。
+on: push
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+      - name: Deploy
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: ./deploy.sh
