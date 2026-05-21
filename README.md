@@ -9,6 +9,8 @@ GitHub Actions workflow 預設不安全：缺 `timeout-minutes`、`permissions` 
 - **Hardening (H1-H3)** — 逐 job 檢查缺 `permissions` / `timeout-minutes`、floating 或缺失的 action ref
 - **Secret exposure (S1-S3)** — `pull_request_target` 配 secret、shell echo secret（含 env-then-echo 間接形式）、hardcoded credential
 
+> 註：H1-H3、S1-S2 走 parse 後的結構判斷，註解不會誤觸發。**S3（hardcoded credential）刻意掃原始文字**，所以連註解裡 credential-looking 的值也會報 —— 因為註解裡留真 token 同樣有外洩風險。
+
 輸出 `markdown` / `text` / `json` 三種格式，可直接貼 PR comment 或當 CI fail gate（`FAIL_ON_CRITICAL=1`）。
 
 ## 三方協作 flow（這個 repo 用的）

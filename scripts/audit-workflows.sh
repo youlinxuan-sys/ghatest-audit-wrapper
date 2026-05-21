@@ -129,6 +129,34 @@ def iter_uses(steps) -> list:
     return out
 
 
+def iter_strings(node):
+    """遞迴走訪 parsed YAML，yield 出所有 string 純量值。
+
+    用於把 secret 判斷限縮在『workflow 真正用到的值』 —— parse 後註解
+    已不存在，所以掃這裡不會被註解裡的 ${{ secrets.* }} 誤觸發。
+    """
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for v in node.values():
+            yield from iter_strings(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from iter_strings(v)
+
+
+def join_continuations(text: str) -> str:
+    """把 shell backslash 續行（行尾 `\\` + 換行）接成同一行。
+
+    workflow 的 `run:` 可能寫成：
+        echo "token \\
+        ${{ secrets.X }}"
+    shell 實際會接成一行，secret 一樣落 log。先 normalize 才不會
+    讓單行 regex 漏掉跨行的 secret echo。
+    """
+    return re.sub(r"\\\n\s*", " ", text)
+
+
 def audit_file(path: Path) -> dict:
     raw = path.read_text(encoding="utf-8", errors="replace")
     findings = []
@@ -203,7 +231,10 @@ def audit_file(path: Path) -> dict:
     else:
         on_keys = [str(x) for x in as_list(on_value)]
     has_pr_target = "pull_request_target" in on_keys
-    has_secret_ref = bool(RE_SECRETS_REF.search(raw))
+    # secret 判斷走 parsed doc 的 string 值，不掃 raw —— 避免註解裡的
+    # ${{ secrets.* }} 造成 false positive（複審 bug 2）。
+    has_secret_ref = any(
+        RE_SECRETS_REF.search(s) for s in iter_strings(doc))
     if has_pr_target and has_secret_ref:
         findings.append(("critical", "S1",
             "`pull_request_target` 同時引用 `${{ secrets.* }}` — "
@@ -228,8 +259,12 @@ def audit_file(path: Path) -> dict:
                 step_env_vars = job_env_vars | collect_secret_env_vars(
                     step.get("env"))
 
+                # 掃描前先接 shell 續行 —— echo "a \<newline> ${{ secrets }}"
+                # 實際是同一行，不 normalize 單行 regex 會漏（複審 bug 1）。
+                scan = join_continuations(run)
+
                 # S2a：run 內直接出現 ${{ secrets.* }}
-                if RE_ECHO_SECRET.search(run):
+                if RE_ECHO_SECRET.search(scan):
                     ln = best_effort_line(raw, run.strip().splitlines()[0])
                     loc = f"L{ln}: " if ln else ""
                     findings.append(("critical", "S2",
@@ -237,7 +272,7 @@ def audit_file(path: Path) -> dict:
                     score += 4
 
                 # S2b：env-then-echo —— echo 引用了綁 secret 的 env 變數
-                for em in RE_ECHO_LINE.finditer(run):
+                for em in RE_ECHO_LINE.finditer(scan):
                     echo_line = em.group(0)
                     for var in step_env_vars:
                         if re.search(r"\$\{?" + re.escape(var) + r"\b\}?",
