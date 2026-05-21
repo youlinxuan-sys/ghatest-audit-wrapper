@@ -7,9 +7,12 @@ GitHub Actions workflow 安全 audit 工具。單一 scanner，把 workflow YAML
 GitHub Actions workflow 預設不安全：缺 `timeout-minutes`、`permissions` 寫太鬆、`uses: foo@main` 浮動 ref、`pull_request_target` 配 `${{ secrets.* }}` 等。`./scripts/audit-workflows.sh` 是一支 unified scanner，用 PyYAML 真正 parse workflow（不靠 regex 猜結構，所以 quoted key、跨行陣列、key order 等 YAML 合法寫法都正確處理），涵蓋兩類規則：
 
 - **Hardening (H1-H3)** — 逐 job 檢查缺 `permissions` / `timeout-minutes`、floating 或缺失的 action ref
-- **Secret exposure (S1-S3)** — `pull_request_target` 配 secret、shell echo secret（含 env-then-echo 間接形式）、hardcoded credential
+- **Secret exposure (S1-S3)** — `pull_request_target` 配 secret（critical）、run 裡 secret 可能落 log（warn，保守標記）、hardcoded credential（warn）
 
-> 註：H1-H3、S1-S2 走 parse 後的結構判斷，註解不會誤觸發。**S3（hardcoded credential）刻意掃原始文字**，所以連註解裡 credential-looking 的值也會報 —— 因為註解裡留真 token 同樣有外洩風險。
+> 註：
+> - **S1** 走 parse 後的結構判斷（`on` 的 key、所有 string 值），確定性高、列 critical。
+> - **S2** 採「保守標記」：一個 step 的 `run` 裡同時出現輸出指令（`echo`/`printf`/`tee`/`cat`/`set-output`）與 secret，就標 **warn**。它不精準解析 shell（heredoc / quote / 子shell 角落無法靠靜態分析窮盡），刻意寧可多標一個 warn 讓人看，也不漏真正的 leak —— 所以 echo 與 secret 在同 `run` 不同指令時也會標。整行 shell 註解會先剝掉、不誤標。
+> - **S3（hardcoded credential）刻意掃原始文字**，連註解裡 credential-looking 的值也會報 —— 註解裡留真 token 同樣有外洩風險。
 
 輸出 `markdown` / `text` / `json` 三種格式，可直接貼 PR comment 或當 CI fail gate（`FAIL_ON_CRITICAL=1`）。
 
