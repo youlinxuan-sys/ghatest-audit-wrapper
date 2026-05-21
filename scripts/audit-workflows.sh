@@ -75,10 +75,13 @@ except ImportError:
 
 # ---- Patterns（只用於掃 run 字串內容，不用來解析 YAML 結構）----
 RE_SECRETS_REF = re.compile(r"\$\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}")
+# 以下兩個吃的是 split_shell_commands() 切好的「單一邏輯 command」字串
+# （可能含 quoted 跨行內容），所以用 DOTALL 讓 .* 跨換行。
 RE_ECHO_SECRET = re.compile(
-    r"\b(echo|printf|tee|set-output)\b[^\n]*\$\{\{\s*secrets\.", re.IGNORECASE
+    r"\b(echo|printf|tee|set-output)\b.*\$\{\{\s*secrets\.",
+    re.IGNORECASE | re.DOTALL,
 )
-RE_ECHO_LINE = re.compile(r"\b(echo|printf|tee)\b[^\n]*", re.IGNORECASE)
+RE_ECHO_LINE = re.compile(r"\b(echo|printf|tee)\b.*", re.IGNORECASE | re.DOTALL)
 RE_HARDCODED = re.compile(
     r"(token|password|api[_-]?key|secret)\s*[:=]\s*['\"]?[A-Za-z0-9_\-]{16,}",
     re.IGNORECASE,
@@ -130,31 +133,82 @@ def iter_uses(steps) -> list:
 
 
 def iter_strings(node):
-    """遞迴走訪 parsed YAML，yield 出所有 string 純量值。
+    """遞迴走訪 parsed YAML，yield 出所有 string 純量值『與 dict key』。
 
     用於把 secret 判斷限縮在『workflow 真正用到的值』 —— parse 後註解
     已不存在，所以掃這裡不會被註解裡的 ${{ secrets.* }} 誤觸發。
+    dict key 也掃（複審 round 4 Low）—— expression 當 key 雖罕見但仍是值。
     """
     if isinstance(node, str):
         yield node
     elif isinstance(node, dict):
-        for v in node.values():
+        for k, v in node.items():
+            if isinstance(k, str):
+                yield k
             yield from iter_strings(v)
     elif isinstance(node, list):
         for v in node:
             yield from iter_strings(v)
 
 
-def join_continuations(text: str) -> str:
-    """把 shell backslash 續行（行尾 `\\` + 換行）接成同一行。
+def split_shell_commands(script: str) -> list:
+    """把一段 shell script 切成「邏輯 command」list。
 
-    workflow 的 `run:` 可能寫成：
-        echo "token \\
-        ${{ secrets.X }}"
-    shell 實際會接成一行，secret 一樣落 log。先 normalize 才不會
-    讓單行 regex 漏掉跨行的 secret echo。
+    為什麼不用單行 regex —— shell 的 quoted string 本身能跨行，
+    backslash 也能續行。單行 regex 會把這些拆斷、漏掉跨行的 secret echo
+    （複審 round 3/4 的 High）。這裡追蹤 quote 狀態，只在「沒被 quote
+    包住」的 command 分隔處（換行 / ; / && / || / 管線 |）才斷開，
+    quote 內的換行與 backslash 續行都歸進同一個 command。
+
+    不是完整 shell parser，但足以把「一個 echo/printf/tee 連同它的
+    跨行 quoted 參數」整段收進同一個 command 字串供後續判斷。
     """
-    return re.sub(r"\\\n\s*", " ", text)
+    cmds = []
+    cur = []
+    in_s = in_d = False
+    i = 0
+    n = len(script)
+    while i < n:
+        ch = script[i]
+        nxt = script[i + 1] if i + 1 < n else ""
+        # backslash 跳脫：連同下一個字元一起吃進來，不觸發斷句
+        if ch == "\\" and nxt:
+            cur.append(ch)
+            cur.append(nxt)
+            i += 2
+            continue
+        if ch == "'" and not in_d:
+            in_s = not in_s
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_s:
+            in_d = not in_d
+            cur.append(ch)
+            i += 1
+            continue
+        if not in_s and not in_d:
+            # command 分隔：換行 / ; / && / || / 單獨的 |
+            if ch == "\n" or ch == ";":
+                cmds.append("".join(cur))
+                cur = []
+                i += 1
+                continue
+            if ch in "&|" and nxt == ch:  # && 或 ||
+                cmds.append("".join(cur))
+                cur = []
+                i += 2
+                continue
+            if ch == "|":  # 單一管線
+                cmds.append("".join(cur))
+                cur = []
+                i += 1
+                continue
+        cur.append(ch)
+        i += 1
+    if cur:
+        cmds.append("".join(cur))
+    return cmds
 
 
 def audit_file(path: Path) -> dict:
@@ -259,31 +313,31 @@ def audit_file(path: Path) -> dict:
                 step_env_vars = job_env_vars | collect_secret_env_vars(
                     step.get("env"))
 
-                # 掃描前先接 shell 續行 —— echo "a \<newline> ${{ secrets }}"
-                # 實際是同一行，不 normalize 單行 regex 會漏（複審 bug 1）。
-                scan = join_continuations(run)
-
-                # S2a：run 內直接出現 ${{ secrets.* }}
-                if RE_ECHO_SECRET.search(scan):
-                    ln = best_effort_line(raw, run.strip().splitlines()[0])
+                # 把 run 切成邏輯 command —— quoted 跨行 / backslash 續行
+                # 都歸進同一個 command，逐個判斷（複審 round 3/4）。
+                for cmd in split_shell_commands(run):
+                    # 行號：用該 command 第一個非空行回原文找
+                    head = next((ln for ln in cmd.splitlines() if ln.strip()),
+                                "").strip()
+                    ln = best_effort_line(raw, head) if head else None
                     loc = f"L{ln}: " if ln else ""
-                    findings.append(("critical", "S2",
-                        f"{loc}在 shell 輸出 secret 表達式 — secret 會落 log"))
-                    score += 4
 
-                # S2b：env-then-echo —— echo 引用了綁 secret 的 env 變數
-                for em in RE_ECHO_LINE.finditer(scan):
-                    echo_line = em.group(0)
-                    for var in step_env_vars:
-                        if re.search(r"\$\{?" + re.escape(var) + r"\b\}?",
-                                     echo_line):
-                            ln = best_effort_line(raw, echo_line.strip())
-                            loc = f"L{ln}: " if ln else ""
-                            findings.append(("critical", "S2",
-                                f"{loc}echo `${var}` — 該變數由 env 綁定 "
-                                f"`${{{{ secrets.* }}}}`，secret 會間接落 log"))
-                            score += 4
-                            break
+                    # S2a：command 內直接出現 echo ... ${{ secrets.* }}
+                    if RE_ECHO_SECRET.search(cmd):
+                        findings.append(("critical", "S2",
+                            f"{loc}在 shell 輸出 secret 表達式 — secret 會落 log"))
+                        score += 4
+
+                    # S2b：env-then-echo —— echo 引用了綁 secret 的 env 變數
+                    if RE_ECHO_LINE.search(cmd):
+                        for var in step_env_vars:
+                            if re.search(r"\$\{?" + re.escape(var) + r"\b\}?",
+                                         cmd):
+                                findings.append(("critical", "S2",
+                                    f"{loc}echo `${var}` — 該變數由 env 綁定 "
+                                    f"`${{{{ secrets.* }}}}`，secret 會間接落 log"))
+                                score += 4
+                                break
 
     # ---- S3：hardcoded credential ----
     for m in RE_HARDCODED.finditer(raw):
