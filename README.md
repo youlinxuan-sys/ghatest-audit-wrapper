@@ -67,7 +67,7 @@ FAIL_ON_CRITICAL=1 ./scripts/audit-workflows.sh   # 有 critical 時 exit 2
 | `FAIL_ON_CRITICAL` | `0` | `1` = 有 critical 發現時 exit 2 |
 | `WARN_SCORE` / `CRITICAL_SCORE` | `3` / `7` | severity 分數門檻 |
 
-`tests/fixtures/` 下有 10 個 workflow fixture，涵蓋各條規則的正反案例，CI 每次跑會對它們做 sanity check。
+`tests/fixtures/` 下有 20 個 workflow fixture，涵蓋各條規則的正反案例與邊界，CI 每次跑會對它們做 sanity check。
 
 ## 狀態
 
